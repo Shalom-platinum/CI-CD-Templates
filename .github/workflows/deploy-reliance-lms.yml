@@ -1,0 +1,268 @@
+name: Deploy Reliance LMS
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+        default: 'dev'
+      azure_resource_group:
+        description: 'Azure Resource Group name'
+        required: true
+        type: string
+        default: 'rg-reliance-lms-dev'
+      azure_app_service_name:
+        description: 'Azure App Service name'
+        required: true
+        type: string
+        default: 'reliance-lms-dev'
+      run_tests:
+        description: 'Run tests'
+        required: false
+        type: boolean
+        default: true
+      run_linting:
+        description: 'Run linting'
+        required: false
+        type: boolean
+        default: true
+      run_security_scan:
+        description: 'Run security scan (CodeQL)'
+        required: false
+        type: boolean
+        default: false
+      build_docker:
+        description: 'Build and push Docker image to ACR'
+        required: false
+        type: boolean
+        default: false
+      deploy_to_staging:
+        description: 'Deploy to staging environment'
+        required: false
+        type: boolean
+        default: false
+      deploy_to_production:
+        description: 'Deploy to production environment'
+        required: false
+        type: boolean
+        default: false
+      notify_on_failure:
+        description: 'Send Slack notification on failure'
+        required: false
+        type: boolean
+        default: true
+      dotnet_version:
+        description: '.NET version'
+        required: false
+        type: string
+        default: '8.0.x'
+
+env:
+  DOTNET_VERSION: ${{ github.event.inputs.dotnet_version }}
+  AZURE_WEBAPP_PACKAGE_PATH: './publish'
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ github.event.inputs.dotnet_version }}
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Run linting (dotnet format)
+        if: ${{ github.event.inputs.run_linting == 'true' }}
+        run: dotnet format --verify-no-changes --verbosity diagnostic
+
+      - name: Build
+        run: dotnet build --configuration Release --no-restore
+
+      - name: Run tests
+        if: ${{ github.event.inputs.run_tests == 'true' }}
+        run: dotnet test --configuration Release --no-build --verbosity normal --collect:"XPlat Code Coverage"
+
+      - name: Publish
+        run: dotnet publish --configuration Release --no-build --output ${{ env.AZURE_WEBAPP_PACKAGE_PATH }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reliance-lms-app
+          path: ${{ env.AZURE_WEBAPP_PACKAGE_PATH }}
+
+  security-scan:
+    name: Security Scan
+    needs: build
+    if: ${{ github.event.inputs.run_security_scan == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: csharp
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ github.event.inputs.dotnet_version }}
+
+      - name: Build for CodeQL
+        run: |
+          dotnet restore
+          dotnet build --configuration Release
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:csharp"
+
+  build-docker:
+    name: Build & Push Docker Image
+    needs: build
+    if: ${{ github.event.inputs.build_docker == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to Azure Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.AZURE_REGISTRY_LOGIN_SERVER }}
+          username: ${{ secrets.AZURE_REGISTRY_USERNAME }}
+          password: ${{ secrets.AZURE_REGISTRY_PASSWORD }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.AZURE_REGISTRY_LOGIN_SERVER }}/reliance-lms:${{ github.sha }}
+            ${{ secrets.AZURE_REGISTRY_LOGIN_SERVER }}/reliance-lms:latest
+
+  deploy-staging:
+    name: Deploy to Staging
+    needs: [build, security-scan, build-docker]
+    if: |
+      always() &&
+      needs.build.result == 'success' &&
+      (needs.security-scan.result == 'success' || needs.security-scan.result == 'skipped') &&
+      (needs.build-docker.result == 'success' || needs.build-docker.result == 'skipped') &&
+      github.event.inputs.deploy_to_staging == 'true'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: reliance-lms-app
+          path: ${{ env.AZURE_WEBAPP_PACKAGE_PATH }}
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy to Azure App Service (Staging)
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ github.event.inputs.azure_app_service_name }}-staging
+          resource-group-name: ${{ github.event.inputs.azure_resource_group }}
+          package: ${{ env.AZURE_WEBAPP_PACKAGE_PATH }}
+          slot-name: staging
+
+      - name: Azure logout
+        run: az logout
+        if: always()
+
+  deploy-production:
+    name: Deploy to Production
+    needs: [build, security-scan, build-docker, deploy-staging]
+    if: |
+      always() &&
+      needs.build.result == 'success' &&
+      (needs.security-scan.result == 'success' || needs.security-scan.result == 'skipped') &&
+      (needs.build-docker.result == 'success' || needs.build-docker.result == 'skipped') &&
+      (needs.deploy-staging.result == 'success' || needs.deploy-staging.result == 'skipped') &&
+      github.event.inputs.deploy_to_production == 'true'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: reliance-lms-app
+          path: ${{ env.AZURE_WEBAPP_PACKAGE_PATH }}
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy to Azure App Service (Production)
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ github.event.inputs.azure_app_service_name }}
+          resource-group-name: ${{ github.event.inputs.azure_resource_group }}
+          package: ${{ env.AZURE_WEBAPP_PACKAGE_PATH }}
+
+      - name: Azure logout
+        run: az logout
+        if: always()
+
+  notify-on-failure:
+    name: Notify on Failure
+    needs: [build, security-scan, build-docker, deploy-staging, deploy-production]
+    if: |
+      failure() &&
+      github.event.inputs.notify_on_failure == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Slack Notification
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "❌ Reliance LMS Deployment Failed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "❌ *Reliance LMS Deployment Failed*\n\n*Environment:* ${{ github.event.inputs.environment }}\n*Branch:* ${{ github.ref_name }}\n*Triggered by:* ${{ github.actor }}\n*Run:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Workflow>"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
