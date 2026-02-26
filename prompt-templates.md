@@ -161,7 +161,7 @@ deploy-staging:
 
 ## OUTPUT
 
-A single GitHub Actions YAML file saved as `.github/workflows/deploy-{{APP_NAME}}.yml` with:
+A single GitHub Actions YAML file saved as `.github/workflows/deploy-web-app-{{PROJECT_TYPE}}{{APP_NAME}}.yml` with:
 - `workflow_dispatch` trigger with all configurable inputs
 - Conditional steps/jobs based on boolean inputs
 - Runtime-configurable parameters for environment, resource group, app service name, and language versions
